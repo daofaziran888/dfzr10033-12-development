@@ -244,6 +244,17 @@ export const MODULES: ModuleMeta[] = [
     actionTargets: {"启动实验": "运行中", "结束实验": "已结束", "终止实验": "已终止"},
     metrics: ["实验总数", "运行中实验", "已结束实验"],
   },
+  {
+    key: "fed_dispatch",
+    name: "受控联邦分发",
+    entity: "分发批次",
+    desc: "从联邦查询缓存的多来源明细按来源归属切分可共享明细，为接收方提供获准来源的只读范围；许可版本化、撤回按领取时核权。",
+    fields: ["批次编号", "接收方", "缓存条目", "申请来源", "许可版本", "获准来源", "只读列", "发布时间"],
+    statuses: ["待发布", "预检通过", "覆盖冲突", "已领取", "已撤回"],
+    actions: ["撤回批次"],
+    actionTargets: {"撤回批次": "已撤回"},
+    metrics: ["批次总数", "预检通过", "覆盖冲突"],
+  },
 ]
 
 export const MODULE_BY_KEY: Map<string, ModuleMeta> = new Map(

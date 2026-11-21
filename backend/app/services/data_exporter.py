@@ -71,6 +71,79 @@ class DataExporterService(BaseModuleService):
             "sample": converted[:200] if len(converted) > 200 else converted,
         }
 
+    def export_dispatch_batch(
+        self,
+        entry_id: int,
+        batch_id: int,
+        fed_dispatch_service: "FedDispatchService | None" = None,
+    ) -> dict[str, Any]:
+        """分析导出受控联邦数据分发批次：只读取获准交付的行和列。
+
+        交付结果回写到分发申请清单（fed_dispatch 批次）并注明所用许可版本；
+        读取前按接收方当前授权重新核权，因此撤回来源后导出同样会被剔除。
+        """
+        from app.services.fed_dispatch import FedDispatchService
+
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": "导出任务不存在"}
+
+        service = fed_dispatch_service or FedDispatchService()
+        payload = service.approved_delivery_payload(batch_id)
+        if payload is None:
+            return {"ok": False, "message": f"分发批次 {batch_id} 不存在"}
+
+        rows = payload["rows"]
+        if not rows:
+            return {"ok": False, "message": "按当前授权没有可交付的明细行"}
+
+        fmt = entry.get("输出格式", "csv")
+        # 只导出获准的只读列，去掉内部核权列
+        clean_rows = [
+            {k: v for k, v in row.items() if not k.startswith("_") and k != "row_id"}
+            for row in rows
+        ]
+        converted, file_size = _format_export(clean_rows, fmt)
+        file_hash = hashlib.md5(converted.encode()).hexdigest()[:16]
+        filename = f"export_dispatch_{batch_id}_{file_hash}.{fmt}"
+
+        entry["status"] = "已完成"
+        entry["pending"] = False
+        # 回写申请清单：注明数据来自哪个分发批次及所用许可版本
+        entry["数据来源"] = f"fed_dispatch:{batch_id}@{payload['license_version']}"
+        entry["许可版本"] = payload["license_version"]
+        entry["分发批次"] = payload["批次编号"]
+
+        batch = store.find("fed_dispatch", batch_id)
+        if batch is not None:
+            service._ensure_extensions(batch)
+            batch.setdefault("export_records", []).append(
+                {
+                    "export_task_id": entry_id,
+                    "license_version": payload["license_version"],
+                    "row_count": len(rows),
+                    "filename": filename,
+                    "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+            batch["最近导出许可版本"] = payload["license_version"]
+
+        _write_mart_entry(entry_id, fmt, len(rows), file_size)
+        _audit_export(entry_id, fmt, 0.0, len(rows), file_size)
+
+        return {
+            "ok": True,
+            "batch_id": batch_id,
+            "license_version": payload["license_version"],
+            "filename": filename,
+            "format": fmt,
+            "row_count": len(rows),
+            "file_size_bytes": file_size,
+            "columns": payload["columns"],
+            "subtotals": payload["subtotals"],
+            "checksum": file_hash,
+        }
+
     def batch_export_to_mart(
         self, mart_id: int, filter_criteria: dict[str, str] | None = None
     ) -> dict[str, Any]:

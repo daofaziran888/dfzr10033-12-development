@@ -207,6 +207,25 @@ def pipeline_export_to_mart(
             "mart": exporter_svc.batch_export_to_mart(mart_id) if mart_id > 0 else None}
 
 
+@router.post("/pipelines/export-dispatch-batch")
+def pipeline_export_dispatch_batch(
+    batch_id: int = Query(...),
+    export_no: str = Query(...),
+    fmt: str = Query(default="csv"),
+) -> dict[str, Any]:
+    """分析导出读取受控联邦数据分发批次获准交付的行和列，并回写许可版本。"""
+    entry, missing = exporter_svc.create_entry({
+        "任务编号": export_no, "数据来源": f"fed_dispatch:{batch_id}", "筛选条件": "licensed_only",
+        "输出格式": fmt, "字段列表": "*", "排序规则": "id", "导出上限": "10000",
+        "接收地址": "local://exports"})
+    if entry is None:
+        raise HTTPException(status_code=400, detail=f"创建导出任务失败: {missing}")
+    result = exporter_svc.export_dispatch_batch(entry["id"], batch_id, fed_dispatch_svc)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return {"ok": True, "pipeline": "export_dispatch_batch", "export": result}
+
+
 @router.post("/pipelines/lake-scan-register")
 def pipeline_lake_scan_register(path_id: int = Query(...)) -> dict[str, Any]:
     return {"ok": True, "pipeline": "lake_scan_register",
@@ -221,3 +240,134 @@ def pipeline_cost_aggregate_alert() -> dict[str, Any]:
             "cost_aggregation": cost_svc.aggregate_module_costs(),
             "quota_check": cost_svc.check_monthly_quota(),
             "cache_report": result_cache_svc.cache_hit_rate_report()}
+
+
+# -- 受控联邦数据分发批次 --
+
+from pydantic import BaseModel
+
+from app.services.fed_dispatch import FedDispatchService
+
+fed_dispatch_svc = FedDispatchService()
+
+
+class DispatchApplicationPayload(BaseModel):
+    receiver: str
+    cache_id: int
+    requested_sources: list[str]
+    visible_columns: list[str] | None = None
+
+
+class LicensePayload(BaseModel):
+    granted_sources: list[str]
+
+
+class RevokePayload(BaseModel):
+    source: str
+
+
+@router.post("/fed_dispatch/applications")
+def create_dispatch_application(payload: DispatchApplicationPayload) -> dict[str, Any]:
+    result = fed_dispatch_svc.create_application(
+        receiver=payload.receiver,
+        cache_id=payload.cache_id,
+        requested_sources=payload.requested_sources,
+        visible_columns=payload.visible_columns,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.post("/fed_dispatch/{batch_id}/license")
+def update_dispatch_license(batch_id: int, payload: LicensePayload) -> dict[str, Any]:
+    result = fed_dispatch_svc.update_license(batch_id, payload.granted_sources)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.post("/fed_dispatch/{batch_id}/revoke")
+def revoke_dispatch_source(batch_id: int, payload: RevokePayload) -> dict[str, Any]:
+    result = fed_dispatch_svc.revoke_source(batch_id, payload.source)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.get("/fed_dispatch/{batch_id}/license-history")
+def dispatch_license_history(batch_id: int) -> dict[str, Any]:
+    result = fed_dispatch_svc.license_history(batch_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result["message"])
+    return result
+
+
+@router.post("/fed_dispatch/{batch_id}/precheck")
+def precheck_dispatch(batch_id: int) -> dict[str, Any]:
+    result = fed_dispatch_svc.precheck(batch_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.post("/fed_dispatch/{batch_id}/publish")
+def publish_dispatch(batch_id: int) -> dict[str, Any]:
+    result = fed_dispatch_svc.publish_batch(batch_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.post("/fed_dispatch/{batch_id}/claim")
+def claim_dispatch(batch_id: int) -> dict[str, Any]:
+    result = fed_dispatch_svc.claim(batch_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.get("/fed_dispatch/{batch_id}/deliveries")
+def dispatch_delivery_history(batch_id: int) -> dict[str, Any]:
+    result = fed_dispatch_svc.delivery_history(batch_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result["message"])
+    return result
+
+
+@router.post("/pipelines/fed-dispatch-lifecycle")
+def pipeline_fed_dispatch_lifecycle(
+    cache_id: int = Query(...),
+    receiver: str = Query(default="下游分析组"),
+    sources: str = Query(default="SRC-A,SRC-B"),
+    revoke_source: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """端到端演示：申请→预检→（可选撤回）→领取，覆盖授权撤回后的核权场景。"""
+    requested = [s.strip() for s in sources.split(",") if s.strip()]
+    app_result = fed_dispatch_svc.create_application(receiver, cache_id, requested)
+    if not app_result.get("ok"):
+        raise HTTPException(status_code=400, detail=app_result["message"])
+    batch_id = app_result["application"]["id"]
+
+    precheck_before = fed_dispatch_svc.precheck(batch_id)
+    publish = fed_dispatch_svc.publish_batch(batch_id)
+
+    revoke_result = None
+    if revoke_source:
+        revoke_result = fed_dispatch_svc.revoke_source(batch_id, revoke_source)
+        precheck_after = fed_dispatch_svc.precheck(batch_id)
+    else:
+        precheck_after = None
+
+    claim = fed_dispatch_svc.claim(batch_id)
+    return {
+        "ok": True,
+        "pipeline": "fed_dispatch_lifecycle",
+        "application": app_result,
+        "precheck_before_revoke": precheck_before,
+        "publish": publish,
+        "revoke": revoke_result,
+        "precheck_after_revoke": precheck_after,
+        "claim": claim,
+        "license_history": fed_dispatch_svc.license_history(batch_id),
+    }
